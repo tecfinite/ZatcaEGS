@@ -1,7 +1,10 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System.IO.Compression;
+using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Runtime.ConstrainedExecution;
 using System.Text;
 using Zatca.eInvoice;
 using Zatca.eInvoice.Helpers;
@@ -15,10 +18,14 @@ namespace ZatcaEGS.Controllers
     {
         private readonly CsrGenerator _csrGenerator;
         private readonly HttpClient _httpClient = new();
+        private readonly ILogger<SetupController> _logger;
+        private readonly IHttpClientFactory _httpClientFactory;
 
-        public SetupController()
+        public SetupController(ILogger<SetupController> logger, IHttpClientFactory httpClientFactory)
         {
             _csrGenerator = new CsrGenerator();
+            _logger = logger;
+            _httpClientFactory = httpClientFactory;
         }
 
         [HttpGet("Setup/UpdateBusinessData")]
@@ -39,6 +46,11 @@ namespace ZatcaEGS.Controllers
         [HttpPost("Setup/IntegrationSetup")]
         public IActionResult IntegrationSetup([FromForm] SetupViewModel viewModel)
         {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
             var model = new CertificateInfo
             {
                 ApiEndpoint = viewModel.Api,
@@ -65,6 +77,18 @@ namespace ZatcaEGS.Controllers
         }
 
 
+        private void UpdateBusinessDetails(SetupViewModel viewModel, CertificateInfo model)
+        {
+            var cert = ObjectCompressor.SerializeToBase64String(model);
+            var businessDetails = viewModel.BusinessDetails;
+            businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.CertificateInfoGuid, cert);
+            businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.LastIcvGuid, "0");
+            businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.LastPihGuid, "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==");
+            viewModel.BusinessDetails = businessDetails;
+            viewModel.BusinessDetailsJson = JsonConvert.SerializeObject(businessDetails);
+        }
+
+
         [HttpPost("Setup/finish")]
         public IActionResult Finish(SetupViewModel viewModel)
         {
@@ -75,14 +99,7 @@ namespace ZatcaEGS.Controllers
                 var cert = ObjectCompressor.SerializeToBase64String(model);
 
                 // Update businessDetails
-                var businessDetails = viewModel.BusinessDetails;
-                businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.CertificateInfoGuid, cert);
-                businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.LastIcvGuid, "0");
-                businessDetails = JsonParser.ModifyStringInEditData(businessDetails, "", ManagerCustomField.LastPihGuid, "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==");
-                viewModel.BusinessDetails = businessDetails;
-
-                // Serialize BusinessDetails for JavaScript
-                viewModel.BusinessDetailsJson = JsonConvert.SerializeObject(businessDetails);
+                UpdateBusinessDetails(viewModel, model);
 
                 model.ApiSecret = viewModel.Token;
                 // Console.WriteLine(viewModel.BusinessDetails);
@@ -182,39 +199,27 @@ namespace ZatcaEGS.Controllers
             try
             {
                 CertificateInfo model = viewModel.CertificateInfo;
-
-                // Get CCSID
                 string jsonContent = JsonConvert.SerializeObject(new { csr = model.GeneratedCSR });
 
-                _httpClient.DefaultRequestHeaders.Clear();
-                _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                _httpClient.DefaultRequestHeaders.AcceptLanguage.Add(new StringWithQualityHeaderValue("en"));
-                _httpClient.DefaultRequestHeaders.Add("OTP", OTP);
-                _httpClient.DefaultRequestHeaders.Add("Accept-Version", "V2");
+                var client = _httpClientFactory.CreateClient();
+                client.DefaultRequestHeaders.Clear();
+                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                client.DefaultRequestHeaders.AcceptLanguage.Add(new StringWithQualityHeaderValue("en"));
+                client.DefaultRequestHeaders.Add("OTP", OTP);
 
-                var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-                var response = await _httpClient.PostAsync(model.ComplianceCSIDUrl, content);
+                // Use model.ComplianceCSIDUrl as the endpoint
+                var response = await client.PostAsync(model.ComplianceCSIDUrl, new StringContent(jsonContent, Encoding.UTF8, "application/json"));
+                response.EnsureSuccessStatusCode();
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    return BadRequest("Error getting CCSID: " + response.ReasonPhrase);
-                }
+                var responseContent = await response.Content.ReadAsStringAsync();
+                // Process responseContent
 
-                var resultContent = await response.Content.ReadAsStringAsync();
-                var zatcaResult = JsonConvert.DeserializeObject<ZatcaResultDto>(resultContent);
-
-                var ccsidResult = new CCSIDResultDto
-                {
-                    CCSIDBinaryToken = zatcaResult.BinarySecurityToken,
-                    CCSIDComplianceRequestId = zatcaResult.RequestID,
-                    CCSIDSecret = zatcaResult.Secret
-                };
-
-                return Ok(ccsidResult);
+                return Ok(responseContent);
             }
-            catch
+            catch (Exception ex)
             {
-                return StatusCode(500, "Internal server error");
+                _logger.LogError(ex, "Error in GetCCSID");
+                return BadRequest("Error in GetCCSID: " + ex.Message);
             }
         }
 
@@ -309,12 +314,12 @@ namespace ZatcaEGS.Controllers
 
                 if (!response.IsSuccessStatusCode)
                 {
+                    _logger.LogError("Error getting PCSID: {ReasonPhrase}", response.ReasonPhrase);
                     return BadRequest("Error getting PCSID: " + response.ReasonPhrase);
                 }
 
                 string resultContent = await response.Content.ReadAsStringAsync();
                 ZatcaResultDto zatcaResult = JsonConvert.DeserializeObject<ZatcaResultDto>(resultContent);
-
 
                 var pcsidResult = new PCSIDResultDto
                 {
@@ -325,9 +330,9 @@ namespace ZatcaEGS.Controllers
 
                 return Ok(pcsidResult);
             }
-
-            catch
+            catch (Exception ex)
             {
+                _logger.LogError(ex, "An error occurred while getting PCSID");
                 return StatusCode(500, "Internal server error");
             }
         }
